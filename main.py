@@ -1,84 +1,122 @@
-import queue
-import sounddevice as sd
-import vosk
 import sys
+import queue
+import time
+import struct
 import json
-import words
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.linear_model import LogisticRegression
+
+import config
+import tts
+from fuzzywuzzy import fuzz
+import datetime
+# import num2t4ru import num2text
+import inflect
+import webbrowser
+import vosk
+import sounddevice as sd
 import pvporcupine
 from pvrecorder import PvRecorder
 
+
 porcupine = pvporcupine.create(access_key='IBLG8U7CAM+kQOHVNcjGhdg+cSso95n6diIAVKc5sFXuLAWpfxlq+g==',
-                               keyword_paths=['./jarvis_en_windows_v2_2_0.ppn'])
+                               keyword_paths=['./jarvis_en/jarvis_en_windows_v3_0_0.ppn'])
 
-q = queue.Queue()
 model = vosk.Model("model")
-device = sd.default.device = 0, 4
-samplerate = int(sd.query_devices(device[0], 'input')['default_samplerate'])
+samplerate = 16000
 kaldi_rec = vosk.KaldiRecognizer(model, samplerate)
+q = queue.Queue()
+
+tts.speak("Hi sir, how can I halp you ... ")
 
 
-def callback(indata, frames, time, status):
+def q_callback(indata, frames, time, status):
     if status:
         print(status, file=sys.stderr)
     q.put(bytes(indata))
 
 
-def recognize(data, vectorizer, clf):
-    trg = words.TRIGGERS.intersection(data.split())
-    if not trg:
-        return
+def respond(voice: str):
+    global recorder
+    print(voice)
 
-    text_vector = vectorizer.transform([data]).toarray()[0]
-    answer = clf.predict([text_vector])[0]
-    print(answer)
+    cmd = recognize_cmd(filter_cmd(voice))
+
+    if cmd['cmd'] not in config.CMD_LIST.keys():
+        tts.speak("What did you say?")
+    else:
+        execute_cmd(cmd['cmd'])
 
 
-def main():
-    vectorizer = CountVectorizer()
-    vectors = vectorizer.fit_transform(list(words.data_set.keys()))
+def filter_cmd(raw_voice: str):
+    cmd = raw_voice
 
-    clf = LogisticRegression()
-    clf.fit(vectors, list(words.data_set.values()))
+    for x in config.ALIAS:
+        cmd = cmd.replace(x, '').strip()
 
-    del words.data_set
+    for x in config.TBR:
+        cmd = cmd.replace(x, '').strip()
 
-    recoder = PvRecorder(device_index=-1, frame_length=porcupine.frame_length)
+    return cmd
 
+
+def recognize_cmd(cmd: str):
+    rc = {'cmd': '', 'percent': 0}
+
+    for c, v in config.CMD_LIST.items():
+        for x in v:
+            vrt = fuzz.ratio(cmd, x)
+            if vrt > rc['percent']:
+                rc['cmd'] = c
+                rc['percent'] = vrt
+
+    return rc
+
+
+def execute_cmd(cmd: str):
+    if cmd == 'help':
+        pass
+    elif cmd == "ctime":
+        c_time = datetime.datetime.now()
+        print(c_time)
+
+        # Using inflect to convert numeric values to words
+        p = inflect.engine()
+        hour_text = p.number_to_words(c_time.hour)
+        minute_text = p.number_to_words(c_time.minute)
+
+        text = f"Now it's {hour_text} {minute_text}"
+        tts.speak(text)
+    elif cmd == 'open_browser':
+        webbrowser.open('https://google.com')
+
+
+recorder = PvRecorder(device_index=-1, frame_length=porcupine.frame_length)
+recorder.start()
+print("Jarvis started working !)")
+
+ltc = time.time() - 1000
+
+while True:
     try:
-        recoder.start()
+        pcm = recorder.read()
+        keyword_index = porcupine.process(pcm)
 
-        while True:
-            keyword_index = porcupine.process(recoder.read())
-            if keyword_index == 0:
-                print("HI")
+        if keyword_index >= 0:
+            recorder.stop()
+            print("Yes, sir.")
+            tts.speak("Yes sir")
+            recorder.start()  # prevent self recording
+            ltc = time.time()
 
-    except KeyboardInterrupt:
-        recoder.stop()
-    finally:
-        porcupine.delete()
-        recoder.delete()
+        while time.time() - ltc <= 10:
+            pcm = recorder.read()
+            sp = struct.pack("h" * len(pcm), *pcm)
 
-    with sd.RawInputStream(samplerate=samplerate, blocksize=4800, device=device[0],
-                           dtype='int16', channels=1, callback=callback):
-        while True:
-            data = q.get()
+            if kaldi_rec.AcceptWaveform(sp):
+                if respond(json.loads(kaldi_rec.Result())["text"]):
+                    ltc = time.time()
 
-            audio_frame = kaldi_rec.AcceptWaveform(data)
-            keyword_index = porcupine.process(audio_frame)
-            if keyword_index == 0:
-                print("Yes, sir")
+                break
 
-            if kaldi_rec.AcceptWaveform(data):
-                data = json.loads(kaldi_rec.Result())['text']
-                recognize(data, vectorizer, clf)
-                print(data)
-            # else:
-            #     data = json.loads(rec.Result())['text']
-            #     recognize(data, vectorizer, clf)
-            #     print(data)
-
-
-if __name__ == "__main__":
-    main()
+    except Exception as err:
+        print(f"Unexpected {err=}, {type(err)=}")
+        raise
